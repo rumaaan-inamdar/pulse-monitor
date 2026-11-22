@@ -148,7 +148,7 @@ If you find a bug or have an idea for improvement:
 
 ## 👨‍💻 Author
 
-**Bilal Inamdar**
+**Rumaan Inamdar**
 
 GitHub: [@rumaan-inamdar](https://github.com/rumaaan-inamdar)
 
