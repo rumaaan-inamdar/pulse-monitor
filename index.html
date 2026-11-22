@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pulse Monitor from Phone Video</title>
+<style>
+  :root { --bg:#f6f7fb; --card:#fff; --text:#1c2030; --muted:#667; --accent:#e5383b; --line:#dde1ee; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12141c; --card:#1c202c; --text:#eef0f8; --muted:#9aa2bb; --line:#2c3144; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,Arial,sans-serif; background:var(--bg); color:var(--text); }
+  .wrap { max-width:720px; margin:0 auto; padding:16px; }
+  h1 { font-size:1.4rem; margin:8px 0 4px; }
+  p.sub { color:var(--muted); margin:0 0 14px; font-size:.9rem; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:14px; }
+  .tabs { display:flex; gap:8px; margin-bottom:10px; }
+  .tabs button { flex:1; padding:10px; border:1px solid var(--line); background:var(--card); color:var(--text); border-radius:10px; font-size:1rem; cursor:pointer; }
+  .tabs button.on { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .video { position:relative; background:#000; border-radius:12px; overflow:hidden; aspect-ratio:4/3; }
+  video { width:100%; height:100%; object-fit:cover; display:block; }
+  .roi { position:absolute; border:3px solid #3ddc84; border-radius:8px; pointer-events:none; }
+  .hint { font-size:.85rem; color:var(--muted); margin:8px 0 0; }
+  .row { display:flex; gap:10px; margin-top:10px; flex-wrap:wrap; }
+  .row button { flex:1; padding:12px; font-size:1rem; border:0; border-radius:10px; cursor:pointer; background:var(--accent); color:#fff; }
+  .row button.alt { background:var(--line); color:var(--text); }
+  .row button:disabled { opacity:.5; }
+  .bar { height:8px; background:var(--line); border-radius:4px; overflow:hidden; margin-top:10px; }
+  .bar div { height:100%; width:0; background:var(--accent); }
+  .bpm { text-align:center; font-size:3rem; font-weight:700; color:var(--accent); line-height:1.1; }
+  .bpm small { font-size:1rem; color:var(--muted); font-weight:400; }
+  .stats { display:flex; justify-content:space-around; text-align:center; font-size:.85rem; color:var(--muted); margin-top:6px; }
+  .stats b { display:block; color:var(--text); font-size:1.1rem; }
+  canvas { width:100%; height:140px; display:block; border-radius:8px; background:var(--bg); }
+  table { width:100%; border-collapse:collapse; font-size:.85rem; }
+  td, th { padding:6px; border-bottom:1px solid var(--line); text-align:left; }
+  .note { font-size:.8rem; color:var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Pulse Monitor from Phone Video</h1>
+  <p class="sub">Experimental heart-rate estimate from camera video using finger PPG and simplified face rPPG.</p>
+
+  <div class="card">
+    <div class="tabs">
+      <button id="tabFinger" class="on">Finger</button>
+      <button id="tabFace">Face</button>
+    </div>
+    <div class="video">
+      <video id="video" autoplay playsinline webkit-playsinline muted></video>
+      <div class="roi" id="roi"></div>
+    </div>
+    <p class="hint" id="hint"></p>
+    <div class="bar"><div id="prog"></div></div>
+    <div class="row">
+      <button id="start">Start 30 s measurement</button>
+      <button id="stop" class="alt" disabled>Stop</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="bpm"><span id="bpm">--</span> <small>BPM</small></div>
+    <div class="stats">
+      <div><b id="bpmPeaks">--</b>Peak method</div>
+      <div><b id="quality">--</b>Signal quality</div>
+      <div><b id="fpsShow">--</b>Frame rate</div>
+    </div>
+    <canvas id="wave" width="680" height="140"></canvas>
+    <canvas id="spec" width="680" height="100" style="height:100px;margin-top:8px"></canvas>
+    <p class="note">Top: filtered pulse waveform. Bottom: frequency spectrum (peak = heart rate).</p>
+  </div>
+
+  <div class="card">
+    <b>Measurement history</b>
+    <table><thead><tr><th>Time</th><th>Mode</th><th>BPM</th><th>Quality</th></tr></thead><tbody id="hist"></tbody></table>
+    <div class="row"><button class="alt" id="csv">Download CSV</button><button class="alt" id="clear">Clear</button></div>
+  </div>
+
+  <p class="note">Educational prototype only, not a medical device. Face mode is experimental; validate readings against a reference device.
+  Camera access needs https:// or localhost (opening the file directly may work on desktop; on phones host it or use a live server).</p>
+</div>
+
+<script>
+(function () {
+  const DURATION = 30;           // seconds
+  const FS = 30;                 // resample rate (Hz)
+  const $ = id => document.getElementById(id);
+  const video = $('video'), roi = $('roi');
+  const grab = document.createElement('canvas');
+  const gctx = grab.getContext('2d', { willReadFrequently: true });
+
+  let mode = 'finger', stream = null, running = false, t0 = 0, raf = 0;
+  let times = [], vals = [], lastFilt = null;
+  let lastSampleTime = -Infinity, lastAnalyzedSampleCount = -1;
+  let history = [];
+  try {
+    const savedHistory = JSON.parse(localStorage.getItem('pulseHistory') || '[]');
+    history = Array.isArray(savedHistory) ? savedHistory.slice(0, 50) : [];
+  } catch (e) { history = []; }
+
+  // ---------- Camera ----------
+  function stopCamera() {
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop());
+      stream = null;
+    }
+    video.pause();
+    video.srcObject = null;
+  }
+
+  function cameraErrorMessage(error) {
+    const messages = {
+      NotAllowedError: 'Camera permission was denied. Allow camera access in Chrome and Android settings.',
+      NotFoundError: 'No suitable camera was found on this device.',
+      NotReadableError: 'The camera is busy or unavailable. Close other apps using the camera and try again.',
+      OverconstrainedError: 'The requested camera settings are not supported. Try another camera or browser.',
+      SecurityError: 'Camera access was blocked by the browser security settings. Use HTTPS.',
+      AbortError: 'Camera startup was interrupted. Please try again.'
+    };
+    return messages[error && error.name] || (error && error.message) || 'Unknown camera error.';
+  }
+
+  async function startCamera() {
+    // Camera access requires a secure context (HTTPS, or localhost).
+    if (!window.isSecureContext) {
+      throw new Error('This page is not secure. Open the project using an HTTPS website.');
+    }
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error('Camera API is unavailable. Use an up-to-date Chrome browser over HTTPS.');
+    }
+
+    stopCamera();
+
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: mode === 'finger' ? 'environment' : 'user' },
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+          frameRate: { ideal: 30 }
+        },
+        audio: false
+      });
+
+      video.srcObject = stream;
+      video.muted = true;
+      video.playsInline = true;
+
+      // Wait until Chrome has started playback and has usable video dimensions.
+      await video.play();
+      if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+        await new Promise((resolve, reject) => {
+          const onReady = () => { cleanup(); resolve(); };
+          const onError = () => { cleanup(); reject(new Error('The camera opened, but video frames could not be loaded.')); };
+          const timeout = setTimeout(() => {
+            cleanup();
+            reject(new Error('Timed out waiting for camera video. Please try again.'));
+          }, 8000);
+          function cleanup() {
+            clearTimeout(timeout);
+            video.removeEventListener('loadeddata', onReady);
+            video.removeEventListener('error', onError);
+          }
+          video.addEventListener('loadeddata', onReady, { once: true });
+          video.addEventListener('error', onError, { once: true });
+        });
+      }
+
+      if (!video.videoWidth || !video.videoHeight) {
+        throw new Error('The camera started but did not provide valid video dimensions.');
+      }
+
+      // Torch is optional and not supported by every Android phone/browser.
+      if (mode === 'finger') {
+        const track = stream.getVideoTracks()[0];
+        try {
+          if (track && typeof track.getCapabilities === 'function') {
+            const capabilities = track.getCapabilities();
+            if (capabilities.torch) {
+              await track.applyConstraints({ advanced: [{ torch: true }] });
+            }
+          }
+        } catch (torchError) {
+          console.warn('Flashlight could not be enabled; continue with adequate lighting.', torchError);
+        }
+      }
+
+      console.log('Camera ready:', video.videoWidth + 'x' + video.videoHeight);
+      return true;
+    } catch (error) {
+      stopCamera();
+      throw error;
+    }
+  }
+
+  // ---------- Signal processing ----------
+  function resample(t, v) {
+    const dur = t[t.length - 1] - t[0], n = Math.floor(dur * FS), out = [];
+    let j = 0;
+    for (let i = 0; i < n; i++) {
+      const x = t[0] + i / FS;
+      while (j < t.length - 2 && t[j + 1] < x) j++;
+      const f = (x - t[j]) / ((t[j + 1] - t[j]) || 1);
+      out.push(v[j] + (v[j + 1] - v[j]) * Math.min(Math.max(f, 0), 1));
+    }
+    return out;
+  }
+  function movAvg(a, w) {
+    const out = new Array(a.length), h = Math.floor(w / 2);
+    for (let i = 0; i < a.length; i++) {
+      let s = 0, c = 0;
+      for (let k = Math.max(0, i - h); k <= Math.min(a.length - 1, i + h); k++) { s += a[k]; c++; }
+      out[i] = s / c;
+    }
+    return out;
+  }
+  // Simple band-pass: subtract slow trend (~1 s window), then smooth (~0.15 s)
+  function filter(sig) {
+    const trend = movAvg(sig, FS);
+    const hp = sig.map((x, i) => x - trend[i]);
+    const lp = movAvg(hp, 5);
+    const sd = Math.sqrt(lp.reduce((s, x) => s + x * x, 0) / lp.length) || 1;
+    return lp.map(x => x / sd);
+  }
+  function spectrum(sig) {
+    const n = sig.length, out = [];
+    const w = sig.map((x, i) => x * (0.5 - 0.5 * Math.cos(2 * Math.PI * i / (n - 1)))); // Hann
+    for (let bpm = 42; bpm <= 180; bpm += 0.5) {
+      const f = bpm / 60; let re = 0, im = 0;
+      for (let i = 0; i < n; i++) { const a = 2 * Math.PI * f * i / FS; re += w[i] * Math.cos(a); im -= w[i] * Math.sin(a); }
+      out.push({ bpm, p: re * re + im * im });
+    }
+    return out;
+  }
+  function peaksBPM(sig) {
+    const idx = [], minGap = Math.round(FS * 0.33);
+    for (let i = 1; i < sig.length - 1; i++) {
+      if (sig[i] > 0.3 && sig[i] > sig[i - 1] && sig[i] >= sig[i + 1] && (!idx.length || i - idx[idx.length - 1] >= minGap)) idx.push(i);
+    }
+    if (idx.length < 3) return null;
+    const iv = []; for (let i = 1; i < idx.length; i++) iv.push((idx[i] - idx[i - 1]) / FS);
+    iv.sort((a, b) => a - b);
+    const med = iv[Math.floor(iv.length / 2)];
+    return 60 / med;
+  }
+  function analyze(final) {
+    if (times.length < FS * 4) return null;
+    const sig = filter(resample(times, vals));
+    const sp = spectrum(sig);
+    let best = sp[0], total = 0;
+    sp.forEach(s => { total += s.p; if (s.p > best.p) best = s; });
+    const quality = Math.round(100 * best.p / (total || 1) * 3);  // rough peak dominance
+    return { sig, sp, bpm: best.bpm, peaks: peaksBPM(sig), quality: Math.min(100, quality) };
+  }
+
+  // ---------- Drawing ----------
+  function drawLine(cv, data, color) {
+    const c = cv.getContext('2d'), W = cv.width, H = cv.height;
+    c.clearRect(0, 0, W, H);
+    if (!data || data.length < 2) return;
+    const mn = Math.min(...data), mx = Math.max(...data), r = (mx - mn) || 1;
+    c.strokeStyle = color; c.lineWidth = 2; c.beginPath();
+    data.forEach((y, i) => {
+      const px = i / (data.length - 1) * W, py = H - 8 - (y - mn) / r * (H - 16);
+      i ? c.lineTo(px, py) : c.moveTo(px, py);
+    });
+    c.stroke();
+  }
+
+  // ---------- Capture loop ----------
+  function loop() {
+    if (!running) return;
+
+    const now = (performance.now() - t0) / 1000;
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+
+    // Sample at no more than the configured 30 Hz, using elapsed timestamps.
+    if (vw > 0 && vh > 0 && now - lastSampleTime >= 1 / FS) {
+      const p = mode === 'finger'
+        ? [0.25, 0.25, 0.5, 0.5]
+        : [0.35, 0.12, 0.3, 0.22];
+
+      const sx = vw * p[0];
+      const sy = vh * p[1];
+      const sw = vw * p[2];
+      const sh = vh * p[3];
+
+      try {
+        grab.width = 32;
+        grab.height = 32;
+        gctx.drawImage(video, sx, sy, sw, sh, 0, 0, 32, 32);
+        const pixels = gctx.getImageData(0, 0, 32, 32).data;
+        let sum = 0;
+        let count = 0;
+        const channel = mode === 'finger' ? 0 : 1;
+
+        for (let i = 0; i < pixels.length; i += 4) {
+          sum += pixels[i + channel];
+          count++;
+        }
+
+        if (count > 0) {
+          times.push(now);
+          vals.push(sum / count);
+          lastSampleTime = now;
+        }
+      } catch (error) {
+        console.error('Video frame processing failed:', error);
+        stopAll();
+        $('hint').textContent = 'Unable to process camera frames. Please restart the measurement.';
+        return;
+      }
+    }
+
+    $('prog').style.width = Math.min(100, now / DURATION * 100) + '%';
+    $('hint').textContent = 'Measuring... ' + Math.max(0, Math.ceil(DURATION - now)) + ' s left. Stay still.';
+
+    if (times.length >= FS * 4 && times.length !== lastAnalyzedSampleCount && times.length % 15 === 0) {
+      const result = analyze(false);
+      if (result) {
+        drawLine($('wave'), result.sig.slice(-FS * 10), '#e5383b');
+        lastFilt = result;
+      }
+      lastAnalyzedSampleCount = times.length;
+    }
+
+    $('fpsShow').textContent = now > 0 ? Math.round(times.length / now) + ' fps' : '--';
+
+    if (now >= DURATION) return finish();
+    raf = requestAnimationFrame(loop);
+  }
+
+  async function start() {
+    if (running) return;
+    $('start').disabled = true;
+    $('stop').disabled = true;
+    $('hint').textContent = 'Requesting camera permission...';
+
+    try {
+      // Ask for camera permission only after the user presses Start.
+      await startCamera();
+
+      times = [];
+      vals = [];
+      lastFilt = null;
+      lastSampleTime = -Infinity;
+      lastAnalyzedSampleCount = -1;
+      $('bpm').textContent = '--';
+      $('bpmPeaks').textContent = '--';
+      $('quality').textContent = '--';
+      $('fpsShow').textContent = '--';
+      $('prog').style.width = '0%';
+
+      running = true;
+      t0 = performance.now();
+      $('stop').disabled = false;
+      $('hint').textContent = 'Camera ready. Measuring...';
+      raf = requestAnimationFrame(loop);
+    } catch (error) {
+      running = false;
+      $('start').disabled = false;
+      $('stop').disabled = true;
+      $('hint').textContent = 'Camera error: ' + cameraErrorMessage(error) + ' (' + (error.name || 'Error') + ')';
+      console.error('Unable to start pulse measurement:', error);
+      stopCamera();
+    }
+  }
+
+  function stopAll() {
+    const wasRunning = running;
+    running = false;
+    cancelAnimationFrame(raf);
+    stopCamera();
+    $('start').disabled = false;
+    $('stop').disabled = true;
+    if (wasRunning) $('hint').textContent = 'Measurement stopped. Press Start to try again.';
+  }
+
+  function finish() {
+    stopAll();
+    const r = analyze(true);
+    if (!r) { $('hint').textContent = 'Not enough data. Try again.'; return; }
+    drawLine($('wave'), r.sig, '#e5383b');
+    drawLine($('spec'), r.sp.map(s => s.p), '#3a86ff');
+    $('bpm').textContent = Math.round(r.bpm);
+    $('bpmPeaks').textContent = r.peaks ? Math.round(r.peaks) : '--';
+    $('quality').textContent = r.quality + '%';
+    $('hint').textContent = r.quality < 25 ? 'Weak signal. Improve lighting, stay still and try again.' : 'Done. Compare with a pulse oximeter.';
+    history.unshift({ t: new Date().toLocaleString(), mode, bpm: Math.round(r.bpm), q: r.quality });
+    history = history.slice(0, 50);
+    try { localStorage.setItem('pulseHistory', JSON.stringify(history)); } catch (e) {}
+    renderHistory();
+  }
+
+  function renderHistory() {
+    const body = $('hist');
+    body.replaceChildren();
+    history.forEach(item => {
+      const row = document.createElement('tr');
+      [item.t, item.mode, item.bpm, String(item.q) + '%'].forEach(value => {
+        const cell = document.createElement('td');
+        cell.textContent = value == null ? '' : String(value);
+        row.appendChild(cell);
+      });
+      body.appendChild(row);
+    });
+  }
+
+  // ---------- Mode selection ----------
+  function setMode(m) {
+    if (m !== 'finger' && m !== 'face') return;
+    // Do not change camera mode while getUserMedia is still starting.
+    if ($('start').disabled && !running) return;
+    // If a measurement is active, release its camera before changing modes.
+    if (running || stream) stopAll();
+
+    mode = m;
+    $('tabFinger').classList.toggle('on', m === 'finger');
+    $('tabFace').classList.toggle('on', m === 'face');
+
+    // Clear the previous mode's result so it cannot be mistaken for the new mode.
+    $('bpm').textContent = '--';
+    $('bpmPeaks').textContent = '--';
+    $('quality').textContent = '--';
+    $('fpsShow').textContent = '--';
+    $('prog').style.width = '0%';
+    drawLine($('wave'), [], '#e5383b');
+    drawLine($('spec'), [], '#3a86ff');
+
+    if (m === 'finger') {
+      roi.style.cssText = 'left:25%;top:25%;width:50%;height:50%';
+      $('hint').textContent = 'Finger mode selected. Place your fingertip over the rear camera and flash, then press Start.';
+    } else {
+      roi.style.cssText = 'left:35%;top:12%;width:30%;height:22%';
+      $('hint').textContent = 'Face mode selected. Face the front camera in bright, steady lighting, then press Start.';
+    }
+  }
+
+  // ---------- Events ----------
+  $('tabFinger').onclick = () => setMode('finger');
+  $('tabFace').onclick = () => setMode('face');
+  $('start').onclick = start;
+  $('stop').onclick = stopAll;
+  $('clear').onclick = () => { history = []; try { localStorage.removeItem('pulseHistory'); } catch (e) {} renderHistory(); };
+  $('csv').onclick = () => {
+    const escapeCsv = value => '"' + String(value ?? '').replace(/"/g, '""') + '"';
+    const rows = [['time', 'mode', 'bpm', 'quality']];
+    history.forEach(item => rows.push([item.t, item.mode, item.bpm, item.q]));
+    const csv = rows.map(row => row.map(escapeCsv).join(',')).join('\r\n');
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'pulse_results.csv';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  renderHistory();
+  setMode('finger');
+
+  // Release camera hardware if the page is closed or navigated away from.
+  window.addEventListener('pagehide', stopAll);
+})();
+</script>
+</body>
+</html>
