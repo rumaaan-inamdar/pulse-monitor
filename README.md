@@ -78,17 +78,6 @@ In this project:
 
 **Important:** Camera access through the browser generally requires HTTPS or localhost. Opening the HTML file directly may not provide camera access on mobile devices.
 
-### Option 2: Run Using GitHub Pages
-
-The application can be hosted using GitHub Pages.
-
-1. Open your repository on GitHub.
-2. Navigate to **Settings → Pages**.
-3. Under Build and deployment, select **Deploy from a branch**.
-4. Select the `main` branch and `/ (root)` folder.
-5. Save the settings.
-6. Open the published GitHub Pages URL.
-
 ## 📱 How to Use
 
 1. Open the application using Chrome or another supported modern browser.
