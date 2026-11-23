@@ -150,9 +150,11 @@ If you find a bug or have an idea for improvement:
 
 **Rumaan Inamdar**
 
-GitHub: [@rumaan-inamdar](https://github.com/rumaaan-inamdar)
+Contributor : [@rumaan-inamdar](https://github.com/rumaaan-inamdar)
 
 Project: [Pulse Monitor](https://github.com/rumaaan-inamdar/pulse-monitor)
+
+Prototype link : https://rumaaan-inamdar.github.io/pulse-monitor/
 
 ---
 
